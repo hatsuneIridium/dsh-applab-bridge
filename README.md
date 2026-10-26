@@ -20,14 +20,14 @@ UNO Q / VENTUNO Q 板子
 | 工具 | 作用 |
 | --- | --- |
 | `applab_doctor` | 诊断：配置路径、adb 位置、在线设备、板端 uname 与 CLI 版本 |
-| `applab_status` | 板子身份 + `app ps --all` 运行态 |
-| `applab_apps_list` | `app list --all` + `app ps --all` |
-| `applab_app_details` | `app details <id>`（元数据、Bricks、变量） |
-| `applab_app_create` | `app new`，支持 `--from-app` 复制示例、`--bricks`、`--no-sketch` |
-| `applab_app_start` / `_stop` / `_restart` | 生命周期 |
+| `applab_status` | 板子身份 + App 总数 + 正在运行/启动中/失败的 App（按状态过滤） |
+| `applab_apps_list` | `app list`（0.14+ 自动加 `--all`），返回结构化列表 + CLI 原始表格 |
+| `applab_app_details` | 0.14+ 用 `app details`；0.13 退回读 `app.yaml` + 文件树（仅 `user:` App） |
+| `applab_app_create` | `app new`，支持 `--from-app` 复制示例、`--bricks`、`--description`、`--icon`、`--no-sketch` |
+| `applab_app_start` / `_stop` / `_restart` | 生命周期；start/restart 在板端后台执行并轮询到 running（不被 adb 超时打断） |
 | `applab_app_logs` | `app logs`，可 `--follow` 采集若干秒后截断 |
 | `applab_app_pull` | 把 `user:` App 源码 `adb pull` 到本地工作区 |
-| `applab_app_push` | 本地改完 `adb push` 回板子，默认顺带 `app restart` |
+| `applab_app_push` | 本地改完 `adb push` 回板子，默认顺带重启 |
 | `applab_shell` | 板端 POSIX shell（逃生通道） |
 | `applab_bricks_list` / `applab_models_list` | Brick 目录 / AI 模型目录 |
 
@@ -39,6 +39,15 @@ UNO Q / VENTUNO Q 板子
 3. 板子上 `arduino-app-cli` 可执行（系统镜像自带；App Lab 的终端里能跑就说明没问题）。
 
 > App Lab 可以同时开着。它用 adb 时同一时刻只能有一个 `adb server`，两边会共用，不冲突。
+
+### 板端 CLI 兼容性
+
+| CLI 版本 | 行为 |
+| --- | --- |
+| 0.13（实测 UNO Q 出厂镜像） | `app list` 已含全部 App 与状态；没有 `app ps` / `app list --all` / `app details`；插件自动改用 `app.yaml` + 文件树 |
+| 0.14+ | 使用 `app ps --all`、`app details`、`app list --all` |
+
+版本以 `arduino-app-cli version` 为准，插件的 `applab_doctor` 会打印出来。
 
 ## 安装
 
@@ -113,10 +122,13 @@ DSH：applab_app_pull user:blink
 ## 已知限制
 
 - 只支持 **USB + adb**（Connected Mode）。网络模式（SSH）未支持。
-- `app list` / `app ps` 返回文本表格，不是结构化 JSON。
+- 0.13 的 `app list` 只有文本表格；插件会顺带解析成结构化列表，但列格式若变仍以原始表格为准。
 - `applab_app_logs --follow` 是“采集 N 秒后截断”，不是持久流。
 - 内置示例（`examples:` / `release:`）只读：先 `applab_app_create` 用 `fromApp` 复制。
-- 首次 `app start` 可能要下载容器/模型，记得给大超时。
+- 首次 `app start` 要编译 sketch / 拉容器，实机冷启动约 3–5 分钟；插件在板端后台执行并轮询，不会因等待超时打断启动。
+- 板子没有联网时，`app start` 里需要下载依赖的步骤会失败（日志里有 ERROR），这是板端环境问题，不是插件问题。
+- 0.13 的 `model list` 在无网络时会长时间不返回（插件 20 秒超时并明确标记）。
+- 没有删除 App 的工具：0.13 用 `app destroy`，0.14+ 命令名可能不同，暂不封装。
 
 ## 安全
 
@@ -128,8 +140,8 @@ DSH：applab_app_pull user:blink
 | --- | --- |
 | 生成方式 | 代码由 **AI（DeepSeek Harness 内的 agent）** 在会话中生成：需求 → 设计 → 实现 → 测试脚本，均在同一会话内完成。 |
 | 人工审查 | 提交者逐文件审查了：命令拼装与注入面（`lib/commands.js` 的引用与白名单校验）、adb 设备选择与超时/杀进程逻辑、配置读写与首次生成、工具描述与错误提示；确认无误后提交。 |
-| 已验证 | 14 项单元测试（参数校验、shell 引用、设备解析、配置读写、进程超时）+ 插件形状冒烟（工具注册/释放、错误路径、doctor 实跑 adb）。 |
-| 未验证 | **真机链路**：提交时手边没有可连接的板子（`adb devices` 为空），`arduino-app-cli` 的实际输出格式、`adb push` 的属主行为需要在真实 UNO Q 上复核。 |
+| 已验证 | 15 项单元测试（参数校验、shell 引用、设备解析、配置读写、进程超时、`app list` 表格解析）+ 插件形状冒烟 + **真机**：UNO Q（CLI 0.13.0）、adb pull/push 源码往返、改 `python/main.py` 后推回、`app start` 后台启动并轮询到 running、`app logs`、`app stop`、`app destroy` 均已跑通。 |
+| 未验证 | 0.14+ 的 `app ps` / `app details` / `app list --all` 分支没有实机（本机板子是 0.13）；网络模式（SSH）；Windows 以外的平台。 |
 | 提交记录 | 首个功能提交的 message 中同样标注了 AI 生成与人工审查。 |
 
 发现问题请开 issue；涉及板端行为的，请附上 `applab_doctor` 的输出和板端 `arduino-app-cli version`。

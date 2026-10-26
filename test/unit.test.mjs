@@ -11,8 +11,10 @@ import { DEFAULTS, loadConfig, normalizeConfig, workspaceRoot } from '../lib/con
 import { parseDevices, pickDevice, resolveAdb, runProcess } from '../lib/adb.js'
 import {
   buildCliCommand,
+  isActiveStatus,
   newAppArgv,
   normalizeAppId,
+  parseAppList,
   quoteArg,
   remoteAppPath,
   shQuote,
@@ -34,8 +36,28 @@ test('quoteArg 只给需要的参数加引号', () => {
 test('buildCliCommand 拼出可读命令', () => {
   assert.equal(
     buildCliCommand(['app', 'start', 'user:my-app']),
-    'app start user:my-app',
+    'arduino-app-cli app start user:my-app',
   )
+})
+
+test('parseAppList 解析 0.13 的 app list 表格', () => {
+  const text = [
+    'ID                                                                                             NAME                                                     ICON STATUS        EXAMPLE ',
+    'user:test                                                                                      Test                                                     🇨🇳   stopped       false   ',
+    'examples:inspirational/blink                                                                   Blink LED from Python                                    🔴   uninitialized true    ',
+    'user:running-app                                                                               Running App                                              💡   running       false   ',
+    '',
+  ].join('\n')
+  const rows = parseAppList(text)
+  assert.equal(rows.length, 3)
+  assert.deepEqual(rows[0], {
+    id: 'user:test', name: 'Test', icon: '🇨🇳', status: 'stopped', example: false, active: false,
+  })
+  assert.equal(rows[2].active, true)
+  assert.equal(rows[2].status, 'running')
+  assert.equal(isActiveStatus('failed'), true)
+  assert.equal(isActiveStatus('uninitialized'), false)
+  assert.deepEqual(parseAppList(''), [])
 })
 
 test('validateAppName 接受常见名字、拒绝危险字符', () => {
@@ -66,6 +88,10 @@ test('newAppArgv 组装参数', () => {
   assert.deepEqual(
     newAppArgv('Demo', { fromApp: 'examples:inspirational/blink', bricks: ['arduino:web_ui'], noSketch: true }),
     ['app', 'new', 'Demo', '--from-app', 'examples:inspirational/blink', '--bricks', 'arduino:web_ui', '--no-sketch'],
+  )
+  assert.deepEqual(
+    newAppArgv('Demo', { description: 'hi', icon: '💡' }),
+    ['app', 'new', 'Demo', '--description', 'hi', '--icon', '💡'],
   )
 })
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-applab-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Bridge Arduino App Lab / UNO Q into DeepSeek Harness (DSH): list, create, start and stop apps, tail logs, and pull/push app sources over adb.",
   "type": "module",
   "main": "index.js",

@@ -12,9 +12,12 @@ import { loadConfig, workspaceRoot } from './lib/config.js'
 import { Board, BoardError, toToolResult } from './lib/board.js'
 import { parseDevices, resolveAdb, runProcess } from './lib/adb.js'
 import {
+  isActiveStatus,
   newAppArgv,
   normalizeAppId,
+  parseAppList,
   remoteAppPath,
+  shQuote,
   userAppName,
   validateAppName,
 } from './lib/commands.js'
@@ -135,7 +138,7 @@ export default {
     register({
       name: 'applab_status',
       description:
-        '板子与 App 运行态总览：板端 uname、arduino-app-cli 版本、`app ps --all`（运行中/已停止/失败）。定位“为什么没跑起来”的第一步。',
+        '板子与 App 运行态总览：板端 uname、arduino-app-cli 版本、App 总数与正在运行/启动中/失败的 App。定位“为什么没跑起来”的第一步。',
       parameters: {},
       output: output(),
       async execute() {
@@ -143,12 +146,18 @@ export default {
           const { config: cfg } = config()
           const b = board(cfg)
           const identity = await b.identity()
-          const ps = await b.cli(['app', 'ps', '--all'], { timeoutMs: 30000 })
-          return {
-            ok: ps.res.code === 0,
+          const list = await b.cli(['app', 'list'], { timeoutMs: 45000 })
+          const rows = parseAppList(list.res.stdout)
+          const active = rows.filter((row) => isActiveStatus(row.status))
+          const result = {
+            ok: list.res.code === 0,
             ...identity,
-            ps: toToolResult(ps.res, ps.command, {}),
+            totalApps: rows.length,
+            activeCount: active.length,
+            active,
           }
+          if (list.res.code !== 0) Object.assign(result, toToolResult(list.res, list.command))
+          return result
         })
       },
     })
@@ -156,20 +165,24 @@ export default {
     register({
       name: 'applab_apps_list',
       description:
-        '列出板子上的 App：`app list --all`（含示例与 release）加 `app ps --all`（运行态）。返回的是 arduino-app-cli 的原始表格，App id 形如 user:my-app、examples:inspirational/blink。',
+        '列出板子上的 App：`app list`（0.14+ 加 --all）。返回结构化列表（id/name/icon/status/example）以及 CLI 原始表格；App id 形如 user:my-app、examples:inspirational/blink。',
       parameters: {},
       output: output(),
       async execute() {
         return guarded(async () => {
           const { config: cfg } = config()
           const b = board(cfg)
-          const list = await b.cli(['app', 'list', '--all'], { timeoutMs: 45000 })
-          const ps = await b.cli(['app', 'ps', '--all'], { timeoutMs: 30000 })
-          return {
-            ok: list.res.code === 0,
-            apps: toToolResult(list.res, list.command, {}),
-            running: toToolResult(ps.res, ps.command, {}),
+          const modern = await b.modern()
+          const argv = ['app', 'list']
+          if (modern) argv.push('--all')
+          const list = await b.cli(argv, { timeoutMs: 60000 })
+          const rows = parseAppList(list.res.stdout)
+          const result = toToolResult(list.res, list.command, { cliVersion: (await b.versionInfo()).text || undefined })
+          if (rows.length) {
+            result.total = rows.length
+            result.apps = rows.map(({ id, name, icon, status, example }) => ({ id, name, icon, status, example }))
           }
+          return result
         })
       },
     })
@@ -177,7 +190,7 @@ export default {
     register({
       name: 'applab_app_details',
       description:
-        '查看一个 App 的详情：`app details <id>`。包含元数据、Bricks 与变量；改 Bricks 前先看它。',
+        '查看一个 App 的详情。0.14+ 用 `app details <id>`；0.13 没有该子命令，改为读取板端 app.yaml 与文件树（仅 user: App）。改 Bricks 前先看它。',
       parameters: {
         id: { type: 'string', required: true, description: 'App id，例如 user:blink 或 examples:inspirational/blink' },
       },
@@ -187,7 +200,27 @@ export default {
           const { config: cfg } = config()
           const id = normalizeAppId(args.id)
           if (id.error) return { ok: false, error: id.error }
-          return cli(cfg, ['app', 'details', id.value], { timeoutMs: 45000 })
+          const b = board(cfg)
+          const modern = await b.modern()
+          if (modern) return cli(cfg, ['app', 'details', id.value], { timeoutMs: 45000 })
+          const remote = remoteAppPath(cfg.appRoot, id.value)
+          if (!remote) {
+            return {
+              ok: false,
+              error: `当前板端 CLI ${(await b.versionInfo()).text || ''} 没有 app details 子命令，且 ${id.value} 不是 user: App。`,
+              hint: '先用 applab_app_create 的 fromApp 把它复制成 user: App，再查看详情。',
+            }
+          }
+          const yaml = await b.shell(`cat ${shQuote(`${remote}/app.yaml`)}`, { timeoutMs: 20000 })
+          const tree = await b.shell(`find ${shQuote(remote)} -maxdepth 2 -type f | sort | head -60`, { timeoutMs: 20000 })
+          return {
+            ok: yaml.res.code === 0,
+            path: remote,
+            cliVersion: (await b.versionInfo()).text || undefined,
+            appYaml: (yaml.res.stdout || '').trim(),
+            files: (tree.res.stdout || '').trim().split(/\r?\n/).filter(Boolean),
+            note: '板端 CLI 没有 app details，这里用 app.yaml + 文件树代替。',
+          }
         })
       },
     })
@@ -203,6 +236,8 @@ export default {
         fromApp: { type: 'string', description: '可选：从已有 App/示例复制，例如 examples:inspirational/blink' },
         bricks: { type: 'array', description: '可选：预装 Brick 列表，例如 ["arduino:web_ui"]' },
         noSketch: { type: 'boolean', description: '可选：只建 Python 部分，不建 sketch（--no-sketch）' },
+        description: { type: 'string', description: '可选：App 描述（--description）' },
+        icon: { type: 'string', description: '可选：单 emoji 图标（--icon）' },
       },
       output: output(),
       async execute(args) {
@@ -217,7 +252,13 @@ export default {
             fromApp = id.value
           }
           const bricks = Array.isArray(args.bricks) ? args.bricks.filter((b) => typeof b === 'string' && b.trim()) : []
-          const argv = newAppArgv(name.value, { fromApp, bricks, noSketch: args.noSketch === true })
+          const argv = newAppArgv(name.value, {
+            fromApp,
+            bricks,
+            noSketch: args.noSketch === true,
+            description: typeof args.description === 'string' ? args.description.trim() : '',
+            icon: typeof args.icon === 'string' ? args.icon.trim() : '',
+          })
           return cli(cfg, argv, { timeoutMs: 120000, extra: { appId: `user:${name.value}` } })
         })
       },
@@ -226,10 +267,10 @@ export default {
     register({
       name: 'applab_app_start',
       description:
-        '启动 App：`app start <id>`。首次启动可能要下载容器/模型，给足超时（默认 300 秒）。启动后用 applab_app_logs 看日志。',
+        '启动 App：板端后台跑 `app start <id> --verbose`，再轮询 `app list` 直到 running 或 failed（默认等 600 秒）。首次启动要编译 sketch / 拉容器，几分钟很正常；超时只会结束等待，不会中断板端启动。返回启动日志尾部。',
       parameters: {
         id: { type: 'string', required: true, description: 'App id，例如 user:my-app' },
-        timeoutSec: { type: 'number', description: '等待上限（秒，默认 300）' },
+        timeoutSec: { type: 'number', description: '等待上限（秒，默认 600）' },
       },
       output: output(),
       async execute(args) {
@@ -237,7 +278,9 @@ export default {
           const { config: cfg } = config()
           const id = normalizeAppId(args.id)
           if (id.error) return { ok: false, error: id.error }
-          return cli(cfg, ['app', 'start', id.value], { timeoutMs: seconds(args.timeoutSec, 300, 5, 1800) })
+          const b = board(cfg)
+          const result = await b.startApp(id.value, { timeoutMs: seconds(args.timeoutSec, 600, 10, 1800) })
+          return { ...result, serial: b.serial }
         })
       },
     })
@@ -261,10 +304,10 @@ export default {
 
     register({
       name: 'applab_app_restart',
-      description: '重启 App：`app restart <id>`。改了代码、push 之后最常用。',
+      description: '重启 App：与 start 相同的后台 + 轮询方式，只是动词换成 `app restart`。改了代码、push 之后最常用。',
       parameters: {
         id: { type: 'string', required: true, description: 'App id，例如 user:my-app' },
-        timeoutSec: { type: 'number', description: '等待上限（秒，默认 300）' },
+        timeoutSec: { type: 'number', description: '等待上限（秒，默认 600）' },
       },
       output: output(),
       async execute(args) {
@@ -272,7 +315,12 @@ export default {
           const { config: cfg } = config()
           const id = normalizeAppId(args.id)
           if (id.error) return { ok: false, error: id.error }
-          return cli(cfg, ['app', 'restart', id.value], { timeoutMs: seconds(args.timeoutSec, 300, 5, 1800) })
+          const b = board(cfg)
+          const result = await b.startApp(id.value, {
+            restart: true,
+            timeoutMs: seconds(args.timeoutSec, 600, 10, 1800),
+          })
+          return { ...result, serial: b.serial }
         })
       },
     })
@@ -294,7 +342,10 @@ export default {
           if (id.error) return { ok: false, error: id.error }
           const follow = args.follow === true
           const fallback = follow ? Math.round(cfg.logTimeoutMs / 1000) || 8 : 3
+          const b = board(cfg)
+          const modern = await b.modern()
           const argv = ['app', 'logs', id.value]
+          if (!modern) argv.push('--tail', '200')
           if (follow) argv.push('--follow')
           const result = await cli(cfg, argv, { timeoutMs: seconds(args.timeoutSec, fallback, 1, 60) })
           if (result.timedOut) result.note = '已按采集时长截断（follow 模式正常现象）。需要更多日志就调大 timeoutSec 再跑一次。'
@@ -366,8 +417,10 @@ export default {
           const chown = await b.shell(`chown -R arduino:arduino ${cfg.appRoot}/${name} 2>&1 || true`, { timeoutMs: 30000 })
           if (chown.res.code !== 0) result.chownWarning = (chown.res.stderr || chown.res.stdout || '').trim()
           if (args.restart !== false) {
-            const restarted = await b.cli(['app', 'restart', id.value], { timeoutMs: seconds(args.timeoutSec, 300, 5, 1800) })
-            result.restart = toToolResult(restarted.res, restarted.command, {})
+            result.restart = await b.startApp(id.value, {
+              restart: true,
+              timeoutMs: seconds(args.timeoutSec, 600, 10, 1800),
+            })
           }
           return result
         })
@@ -414,13 +467,17 @@ export default {
 
     register({
       name: 'applab_models_list',
-      description: '列出板子上的 AI 模型（`model list`），含是否已安装。装模型用 applab_shell 跑 `arduino-app-cli model install <id>`。',
+      description: '列出板子上的 AI 模型（`model list`）。装模型用 applab_shell 跑 `arduino-app-cli model install <id>`。注意：0.13 的 model list 偶尔会卡住（可能在校验远端目录），这里默认 20 秒超时并明确标记。',
       parameters: {},
       output: output(),
       async execute() {
         return guarded(async () => {
           const { config: cfg } = config()
-          return cli(cfg, ['model', 'list'], { timeoutMs: 60000 })
+          const result = await cli(cfg, ['model', 'list'], { timeoutMs: 20000 })
+          if (result.timedOut) {
+            result.note = 'model list 在 20 秒内没有返回，已中止（板端 CLI 可能正在联网校验模型目录）。可稍后重试，或在 App Lab 里查看模型页。'
+          }
+          return result
         })
       },
     })
