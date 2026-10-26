@@ -15,7 +15,6 @@ import {
   isActiveStatus,
   newAppArgv,
   normalizeAppId,
-  parseAppList,
   remoteAppPath,
   shQuote,
   userAppName,
@@ -44,7 +43,8 @@ async function guarded(fn) {
 function seconds(value, fallbackSec, min = 1, max = 3600) {
   const n = typeof value === 'number' ? value : Number(value)
   const sec = Number.isFinite(n) && n > 0 ? n : fallbackSec
-  return Math.min(max, Math.max(min, Math.round(sec * 1000)))
+  const ms = Math.round(sec * 1000)
+  return Math.min(max * 1000, Math.max(min * 1000, ms))
 }
 
 export default {
@@ -146,17 +146,22 @@ export default {
           const { config: cfg } = config()
           const b = board(cfg)
           const identity = await b.identity()
-          const list = await b.cli(['app', 'list'], { timeoutMs: 45000 })
-          const rows = parseAppList(list.res.stdout)
+          const listing = await b.appList({ timeoutMs: 45000 })
+          const rows = listing.rows
           const active = rows.filter((row) => isActiveStatus(row.status))
           const result = {
-            ok: list.res.code === 0,
+            ok: true,
             ...identity,
+            appListFormat: listing.format,
             totalApps: rows.length,
             activeCount: active.length,
             active,
           }
-          if (list.res.code !== 0) Object.assign(result, toToolResult(list.res, list.command))
+          if (!rows.length) {
+            result.ok = false
+            result.output = String(listing.raw || '').slice(0, 2000)
+            result.hint = 'app list 没有解析出任何 App；上面是原始输出，可用来排查 CLI 版本/输出格式。'
+          }
           return result
         })
       },
@@ -173,14 +178,18 @@ export default {
           const { config: cfg } = config()
           const b = board(cfg)
           const modern = await b.modern()
-          const argv = ['app', 'list']
-          if (modern) argv.push('--all')
-          const list = await b.cli(argv, { timeoutMs: 60000 })
-          const rows = parseAppList(list.res.stdout)
-          const result = toToolResult(list.res, list.command, { cliVersion: (await b.versionInfo()).text || undefined })
-          if (rows.length) {
-            result.total = rows.length
-            result.apps = rows.map(({ id, name, icon, status, example }) => ({ id, name, icon, status, example }))
+          const listing = await b.appList({ all: modern, timeoutMs: 60000 })
+          const result = {
+            ok: true,
+            cliVersion: (await b.versionInfo()).text || undefined,
+            appListFormat: listing.format,
+            total: listing.rows.length,
+            apps: listing.rows.map(({ id, name, icon, status, example }) => ({ id, name, icon, status, example })),
+          }
+          if (!listing.rows.length) {
+            result.ok = false
+            result.output = String(listing.raw || '').slice(0, 2000)
+            result.hint = 'app list 没有解析出任何 App；上面是原始输出。'
           }
           return result
         })

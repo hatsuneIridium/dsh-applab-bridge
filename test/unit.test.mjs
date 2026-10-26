@@ -11,10 +11,12 @@ import { DEFAULTS, loadConfig, normalizeConfig, workspaceRoot } from '../lib/con
 import { parseDevices, pickDevice, resolveAdb, runProcess } from '../lib/adb.js'
 import {
   buildCliCommand,
+  decodeAppID,
   isActiveStatus,
   newAppArgv,
   normalizeAppId,
   parseAppList,
+  parseAppListJSON,
   quoteArg,
   remoteAppPath,
   shQuote,
@@ -58,6 +60,35 @@ test('parseAppList 解析 0.13 的 app list 表格', () => {
   assert.equal(isActiveStatus('failed'), true)
   assert.equal(isActiveStatus('uninitialized'), false)
   assert.deepEqual(parseAppList(''), [])
+
+  // 没有图标的 App：ICON 列为空，行里只有 4 段
+  const noIcon = parseAppList('user:plain                                                                                      Plain App                                                       running       false')
+  assert.deepEqual(noIcon[0], {
+    id: 'user:plain', name: 'Plain App', icon: '', status: 'running', example: false, active: true,
+  })
+
+  // 有图标 + 长状态挤成一列：status 不能被图标顶替
+  const iconLong = parseAppList('user:verify                                                                                     Verify                                                      🧪   uninitialized false')
+  assert.deepEqual(iconLong[0], {
+    id: 'user:verify', name: 'Verify', icon: '🧪', status: 'uninitialized', example: false, active: false,
+  })
+})
+
+test('parseAppListJSON 解码 base64 id', () => {
+  const raw = JSON.stringify({
+    apps: [
+      { id: 'dXNlcjp0ZXN0', name: 'Test', icon: '🇨🇳', status: 'stopped', example: false },
+      { id: 'ZXhhbXBsZXM6aW5zcGlyYXRpb25hbC9ibGluaw', name: 'Blink', icon: '', status: 'running', example: true },
+    ],
+  })
+  const rows = parseAppListJSON(raw)
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].id, 'user:test')
+  assert.equal(rows[1].id, 'examples:inspirational/blink')
+  assert.equal(rows[1].active, true)
+  assert.equal(rows[1].example, true)
+  assert.equal(decodeAppID('user:plain'), 'user:plain')
+  assert.deepEqual(parseAppListJSON('not json'), [])
 })
 
 test('validateAppName 接受常见名字、拒绝危险字符', () => {

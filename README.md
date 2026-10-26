@@ -122,13 +122,14 @@ DSH：applab_app_pull user:blink
 ## 已知限制
 
 - 只支持 **USB + adb**（Connected Mode）。网络模式（SSH）未支持。
-- 0.13 的 `app list` 只有文本表格；插件会顺带解析成结构化列表，但列格式若变仍以原始表格为准。
+- 0.13 的 `app list --format json` 会漏掉 uninitialized/broken 的 App（实测 142 个少 7 个），插件以文本表格为主、JSON 只在解析失败时兜底。
+- 0.13 里容器已经起来、日志写了 `App started` 后，`app list` 仍可能显示 `uninitialized`；启动判定以日志标记为准。
 - `applab_app_logs --follow` 是“采集 N 秒后截断”，不是持久流。
 - 内置示例（`examples:` / `release:`）只读：先 `applab_app_create` 用 `fromApp` 复制。
-- 首次 `app start` 要编译 sketch / 拉容器，实机冷启动约 3–5 分钟；插件在板端后台执行并轮询，不会因等待超时打断启动。
+- 首次 `app start` 要编译 sketch / 拉容器，含 sketch 的冷启动约 3–5 分钟；插件在板端后台执行并轮询，不会因等待超时打断启动。
 - 板子没有联网时，`app start` 里需要下载依赖的步骤会失败（日志里有 ERROR），这是板端环境问题，不是插件问题。
 - 0.13 的 `model list` 在无网络时会长时间不返回（插件 20 秒超时并明确标记）。
-- 没有删除 App 的工具：0.13 用 `app destroy`，0.14+ 命令名可能不同，暂不封装。
+- 0.13 的 `app destroy` 只清容器/缓存，**不删源码目录**；要彻底删除需自行 `rm -rf /home/arduino/ArduinoApps/<app>`。插件暂未封装删除。
 
 ## 安全
 
@@ -140,7 +141,7 @@ DSH：applab_app_pull user:blink
 | --- | --- |
 | 生成方式 | 代码由 **AI（DeepSeek Harness 内的 agent）** 在会话中生成：需求 → 设计 → 实现 → 测试脚本，均在同一会话内完成。 |
 | 人工审查 | 提交者逐文件审查了：命令拼装与注入面（`lib/commands.js` 的引用与白名单校验）、adb 设备选择与超时/杀进程逻辑、配置读写与首次生成、工具描述与错误提示；确认无误后提交。 |
-| 已验证 | 15 项单元测试（参数校验、shell 引用、设备解析、配置读写、进程超时、`app list` 表格解析）+ 插件形状冒烟 + **真机**：UNO Q（CLI 0.13.0）、adb pull/push 源码往返、改 `python/main.py` 后推回、`app start` 后台启动并轮询到 running、`app logs`、`app stop`、`app destroy` 均已跑通。 |
+| 已验证 | 16 项单元测试（参数校验、shell 引用、设备解析、配置读写、进程超时、`app list` 表格/JSON 解析）+ 插件形状冒烟 + **真机全链路**：UNO Q（CLI 0.13.0）上 `doctor/status/apps_list/create/start/logs/details/pull/push/stop` 全部跑通；`app start` 冷启动约 6 秒（Python-only），日志出现 `App started`，`app list` 状态变 running。 |
 | 未验证 | 0.14+ 的 `app ps` / `app details` / `app list --all` 分支没有实机（本机板子是 0.13）；网络模式（SSH）；Windows 以外的平台。 |
 | 提交记录 | 首个功能提交的 message 中同样标注了 AI 生成与人工审查。 |
 
