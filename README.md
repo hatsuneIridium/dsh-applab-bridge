@@ -113,6 +113,21 @@ DSH：applab_app_pull user:blink
 
 拉下来的目录就是板上的 App 目录（`app.yaml`、`python/`、`sketch/`、`assets/`），DSH 的读写/搜索/编辑工具可以直接用。推回去之前建议先 `applab_app_stop`，避免容器正在读文件（不强制，CLI 会处理）。
 
+## 示例 App：`examples/hammer-sickle-led`
+
+仓库里带了一个能直接跑的 App：UNO Q 板载 8×13 LED 点阵上的镰刀锤子标志（Python 组帧 + Bridge + `Arduino_LED_Matrix`）。它同时也是本插件的**真机测试程序**——上面「代码来源与审查」里的真机验证就是用它跑的。
+
+```text
+applab_app_create  name="Hammer Sickle Test"
+                   fromApp="examples:core-and-foundational/02-led-matrix/02-led-matrix-frame"
+applab_app_push    id="user:hammer-sickle-test" dir="<repo>/examples/hammer-sickle-led"
+applab_app_start   id="user:hammer-sickle-test"
+applab_app_logs    id="user:hammer-sickle-test"
+```
+
+预览、点阵参数和手动部署步骤见 [examples/hammer-sickle-led/README.md](examples/hammer-sickle-led/README.md)。该示例目录按 MPL-2.0 发布（源自 Arduino 官方示例），插件本体仍是 GPL-3.0。
+
+
 ## 设计取舍
 
 - **为什么不用 App Lab 的 `http://localhost:8800`**：那是 App Lab 通过 SSH 隧道转发到板端 orchestrator 的临时端口，只在 App Lab 运行且选中板子时存在；它没有文件读写接口，做不了“改代码”。插件要的是长期可用、能改源码，所以直接对板子说话。

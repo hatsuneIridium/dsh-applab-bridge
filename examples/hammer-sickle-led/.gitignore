@@ -1,0 +1,9 @@
+# 板端编译缓存与 Python 产物
+.cache/
+__pycache__/
+*.pyc
+
+# 编辑器 / 系统杂项
+.vscode/
+.DS_Store
+Thumbs.db
