@@ -1,0 +1,428 @@
+// 本文件由 AI（DeepSeek Harness）生成，经人工审查后提交；说明见 README「代码来源与审查」。
+// dsh-applab-bridge — 把 Arduino App Lab / UNO Q 接到 DSH。
+//
+// 设计取舍：不复制 App Lab 的私有 UI 通道，而是走板子上官方自带的
+// `arduino-app-cli`（App Lab 自己也是它的前端），传输用 adb（与 App Lab 的
+// Connected Mode 完全一致，USB 免密）。这样 DSH 不依赖 App Lab 是否在运行，
+// 也不会因为 App Lab 升级内部接口而失效。
+import { existsSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import { loadConfig, workspaceRoot } from './lib/config.js'
+import { Board, BoardError, toToolResult } from './lib/board.js'
+import { parseDevices, resolveAdb, runProcess } from './lib/adb.js'
+import {
+  newAppArgv,
+  normalizeAppId,
+  remoteAppPath,
+  userAppName,
+  validateAppName,
+} from './lib/commands.js'
+
+const render = (_args, value) => [
+  { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) },
+]
+
+const output = () => ({ schema: { type: 'json' }, render })
+
+/** 统一错误出口：把 BoardError 的提示原样交给模型，而不是抛栈。 */
+async function guarded(fn) {
+  try {
+    return await fn()
+  } catch (err) {
+    if (err instanceof BoardError) {
+      return { ok: false, error: err.message, hint: err.hint, ...(err.extra || {}) }
+    }
+    return { ok: false, error: String(err && err.message ? err.message : err) }
+  }
+}
+
+/** 秒 → 毫秒，夹在 [min, max] 里。 */
+function seconds(value, fallbackSec, min = 1, max = 3600) {
+  const n = typeof value === 'number' ? value : Number(value)
+  const sec = Number.isFinite(n) && n > 0 ? n : fallbackSec
+  return Math.min(max, Math.max(min, Math.round(sec * 1000)))
+}
+
+export default {
+  inject: ['tools'],
+  apply(ctx) {
+    const disposers = []
+    ctx.effect(() => () => {
+      for (const dispose of disposers.reverse()) {
+        try {
+          dispose()
+        } catch {
+          /* 卸载时忽略单个工具的释放错误 */
+        }
+      }
+    })
+
+    /** 每次调用重新读配置：用户改了 config.json 不必重启 DSH。 */
+    function config() {
+      return loadConfig()
+    }
+
+    function board(cfg) {
+      return new Board(cfg)
+    }
+
+    /** 跑一条 CLI 子命令并归一化结果。 */
+    async function cli(cfg, argv, { timeoutMs, extra } = {}) {
+      const b = board(cfg)
+      const { res, command } = await b.cli(argv, { timeoutMs })
+      return toToolResult(res, command, { serial: b.serial, ...(extra || {}) })
+    }
+
+    function register(definition) {
+      disposers.push(ctx.tools.register(defineTool(definition)))
+    }
+
+    // ── 诊断 ────────────────────────────────────────────────────────────────
+
+    register({
+      name: 'applab_doctor',
+      description:
+        '诊断 DSH 到 Arduino UNO Q / VENTUNO Q 的链路：配置路径、adb 位置（PATH/Arduino App Lab 自带）、在线设备、板端 uname 与 arduino-app-cli 版本。任何 applab_* 工具报错时先跑它。',
+      parameters: {},
+      output: output(),
+      async execute() {
+        return guarded(async () => {
+          const { config: cfg, path, created, warning } = config()
+          const adb = resolveAdb(cfg)
+          const result = {
+            ok: true,
+            configPath: path,
+            configCreated: created,
+            config: cfg,
+            adbPath: adb.path || '(未找到)',
+            adbSource: adb.source || '(未找到)',
+            devices: [],
+          }
+          if (warning) result.configWarning = warning
+          if (!adb.path) {
+            result.ok = false
+            result.hint = '安装 Android platform-tools 并加入 PATH，或在 config.json 里设置 adbPath。装了 Arduino App Lab 时会自动发现它自带的 adb。'
+            return result
+          }
+          const listed = await runProcess({ file: adb.path, args: ['devices', '-l'], timeoutMs: 20000 })
+          result.devices = parseDevices(listed.stdout)
+          if (listed.code !== 0) {
+            result.ok = false
+            result.error = `adb devices 失败：${(listed.stderr || listed.stdout || '').trim() || `退出码 ${listed.code}`}`
+            result.hint = '在终端里手动跑一次 adb version / adb devices，确认 adb 能启动且 5037 端口没被占用。'
+            return result
+          }
+          if (result.devices.length === 0) {
+            result.ok = false
+            result.hint = 'adb 没有看到设备：用数据线连接板子，确认板子已启动并在系统里出现为 USB 设备。'
+            return result
+          }
+          try {
+            result.board = await board(cfg).identity()
+          } catch (err) {
+            result.ok = false
+            result.error = err instanceof BoardError ? err.message : String(err && err.message ? err.message : err)
+            if (err instanceof BoardError) result.hint = err.hint
+          }
+          return result
+        })
+      },
+    })
+
+    // ── 状态 ────────────────────────────────────────────────────────────────
+
+    register({
+      name: 'applab_status',
+      description:
+        '板子与 App 运行态总览：板端 uname、arduino-app-cli 版本、`app ps --all`（运行中/已停止/失败）。定位“为什么没跑起来”的第一步。',
+      parameters: {},
+      output: output(),
+      async execute() {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const b = board(cfg)
+          const identity = await b.identity()
+          const ps = await b.cli(['app', 'ps', '--all'], { timeoutMs: 30000 })
+          return {
+            ok: ps.res.code === 0,
+            ...identity,
+            ps: toToolResult(ps.res, ps.command, {}),
+          }
+        })
+      },
+    })
+
+    register({
+      name: 'applab_apps_list',
+      description:
+        '列出板子上的 App：`app list --all`（含示例与 release）加 `app ps --all`（运行态）。返回的是 arduino-app-cli 的原始表格，App id 形如 user:my-app、examples:inspirational/blink。',
+      parameters: {},
+      output: output(),
+      async execute() {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const b = board(cfg)
+          const list = await b.cli(['app', 'list', '--all'], { timeoutMs: 45000 })
+          const ps = await b.cli(['app', 'ps', '--all'], { timeoutMs: 30000 })
+          return {
+            ok: list.res.code === 0,
+            apps: toToolResult(list.res, list.command, {}),
+            running: toToolResult(ps.res, ps.command, {}),
+          }
+        })
+      },
+    })
+
+    register({
+      name: 'applab_app_details',
+      description:
+        '查看一个 App 的详情：`app details <id>`。包含元数据、Bricks 与变量；改 Bricks 前先看它。',
+      parameters: {
+        id: { type: 'string', required: true, description: 'App id，例如 user:blink 或 examples:inspirational/blink' },
+      },
+      output: output(),
+      async execute(args) {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const id = normalizeAppId(args.id)
+          if (id.error) return { ok: false, error: id.error }
+          return cli(cfg, ['app', 'details', id.value], { timeoutMs: 45000 })
+        })
+      },
+    })
+
+    // ── 创建与生命周期 ───────────────────────────────────────────────────────
+
+    register({
+      name: 'applab_app_create',
+      description:
+        '新建 App：`arduino-app-cli app new <name>`，可从示例复制（fromApp）并预装 Bricks。生成 board 端的 app.yaml、python/、sketch/。创建后用 applab_app_pull 拉到本地改代码。',
+      parameters: {
+        name: { type: 'string', required: true, description: 'App 名称，例如 My Blink App（会变成 user:my-blink-app 之类的 id）' },
+        fromApp: { type: 'string', description: '可选：从已有 App/示例复制，例如 examples:inspirational/blink' },
+        bricks: { type: 'array', description: '可选：预装 Brick 列表，例如 ["arduino:web_ui"]' },
+        noSketch: { type: 'boolean', description: '可选：只建 Python 部分，不建 sketch（--no-sketch）' },
+      },
+      output: output(),
+      async execute(args) {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const name = validateAppName(args.name)
+          if (name.error) return { ok: false, error: name.error }
+          let fromApp = ''
+          if (args.fromApp) {
+            const id = normalizeAppId(args.fromApp)
+            if (id.error) return { ok: false, error: `fromApp 不合法：${id.error}` }
+            fromApp = id.value
+          }
+          const bricks = Array.isArray(args.bricks) ? args.bricks.filter((b) => typeof b === 'string' && b.trim()) : []
+          const argv = newAppArgv(name.value, { fromApp, bricks, noSketch: args.noSketch === true })
+          return cli(cfg, argv, { timeoutMs: 120000, extra: { appId: `user:${name.value}` } })
+        })
+      },
+    })
+
+    register({
+      name: 'applab_app_start',
+      description:
+        '启动 App：`app start <id>`。首次启动可能要下载容器/模型，给足超时（默认 300 秒）。启动后用 applab_app_logs 看日志。',
+      parameters: {
+        id: { type: 'string', required: true, description: 'App id，例如 user:my-app' },
+        timeoutSec: { type: 'number', description: '等待上限（秒，默认 300）' },
+      },
+      output: output(),
+      async execute(args) {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const id = normalizeAppId(args.id)
+          if (id.error) return { ok: false, error: id.error }
+          return cli(cfg, ['app', 'start', id.value], { timeoutMs: seconds(args.timeoutSec, 300, 5, 1800) })
+        })
+      },
+    })
+
+    register({
+      name: 'applab_app_stop',
+      description: '停止 App：`app stop <id>`。',
+      parameters: {
+        id: { type: 'string', required: true, description: 'App id，例如 user:my-app' },
+      },
+      output: output(),
+      async execute(args) {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const id = normalizeAppId(args.id)
+          if (id.error) return { ok: false, error: id.error }
+          return cli(cfg, ['app', 'stop', id.value], { timeoutMs: 120000 })
+        })
+      },
+    })
+
+    register({
+      name: 'applab_app_restart',
+      description: '重启 App：`app restart <id>`。改了代码、push 之后最常用。',
+      parameters: {
+        id: { type: 'string', required: true, description: 'App id，例如 user:my-app' },
+        timeoutSec: { type: 'number', description: '等待上限（秒，默认 300）' },
+      },
+      output: output(),
+      async execute(args) {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const id = normalizeAppId(args.id)
+          if (id.error) return { ok: false, error: id.error }
+          return cli(cfg, ['app', 'restart', id.value], { timeoutMs: seconds(args.timeoutSec, 300, 5, 1800) })
+        })
+      },
+    })
+
+    register({
+      name: 'applab_app_logs',
+      description:
+        '读 App 的 Python 日志：`app logs <id>`。follow=true 时用 `--follow` 采集若干秒后截断返回（默认 8 秒）；默认采集 3 秒。返回带 timedOut 标记说明是主动截断，不是失败。',
+      parameters: {
+        id: { type: 'string', required: true, description: 'App id，例如 user:my-app' },
+        follow: { type: 'boolean', description: '是否跟随新日志（--follow）' },
+        timeoutSec: { type: 'number', description: '采集时长（秒，默认 follow=8 / 非 follow=3）' },
+      },
+      output: output(),
+      async execute(args) {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const id = normalizeAppId(args.id)
+          if (id.error) return { ok: false, error: id.error }
+          const follow = args.follow === true
+          const fallback = follow ? Math.round(cfg.logTimeoutMs / 1000) || 8 : 3
+          const argv = ['app', 'logs', id.value]
+          if (follow) argv.push('--follow')
+          const result = await cli(cfg, argv, { timeoutMs: seconds(args.timeoutSec, fallback, 1, 60) })
+          if (result.timedOut) result.note = '已按采集时长截断（follow 模式正常现象）。需要更多日志就调大 timeoutSec 再跑一次。'
+          return result
+        })
+      },
+    })
+
+    // ── 源码同步 ─────────────────────────────────────────────────────────────
+
+    register({
+      name: 'applab_app_pull',
+      description:
+        '把板子上的 user App 源码拉到本地工作区（adb pull）。之后用 DSH 的读写/编辑工具改本地文件，再用 applab_app_push 推回去并 restart。只支持 user: 开头的 App——示例先用 applab_app_create 的 fromApp 复制一份。',
+      parameters: {
+        id: { type: 'string', required: true, description: 'App id，例如 user:my-app' },
+        dir: { type: 'string', description: '可选：本地工作区根目录（默认 $DSH_HOME/dsh-applab-bridge/workspaces，或配置里的 workspace）' },
+        timeoutSec: { type: 'number', description: '超时（秒，默认 180）' },
+      },
+      output: output(),
+      async execute(args) {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const id = normalizeAppId(args.id)
+          if (id.error) return { ok: false, error: id.error }
+          const remote = remoteAppPath(cfg.appRoot, id.value)
+          if (!remote) {
+            return {
+              ok: false,
+              error: `只能拉取 user: 开头的 App，收到 ${id.value}。`,
+              hint: '内置示例是只读的：先用 applab_app_create 的 fromApp 复制成自己的 App。',
+            }
+          }
+          const workspace = typeof args.dir === 'string' && args.dir.trim() ? args.dir.trim() : workspaceRoot(cfg)
+          const b = board(cfg)
+          const { res, command, localPath } = await b.pull(remote, workspace, {
+            timeoutMs: seconds(args.timeoutSec, 180, 5, 1800),
+          })
+          return toToolResult(res, command, { serial: b.serial, localPath, workspace })
+        })
+      },
+    })
+
+    register({
+      name: 'applab_app_push',
+      description:
+        '把本地工作区里的 App 目录推回板子（adb push），并可选重启。改完代码的标准闭环：applab_app_pull → 本地编辑 → applab_app_push（restart=true）→ applab_app_logs。',
+      parameters: {
+        id: { type: 'string', required: true, description: 'App id，例如 user:my-app' },
+        dir: { type: 'string', description: '可选：本地 App 目录（默认 <workspace>/<app 名>）' },
+        restart: { type: 'boolean', description: '推送后是否 app restart（默认 true）' },
+        timeoutSec: { type: 'number', description: '推送超时（秒，默认 180）' },
+      },
+      output: output(),
+      async execute(args) {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const id = normalizeAppId(args.id)
+          if (id.error) return { ok: false, error: id.error }
+          const name = userAppName(id.value)
+          if (!name) {
+            return { ok: false, error: `只能推送 user: 开头的 App，收到 ${id.value}。` }
+          }
+          const localPath = typeof args.dir === 'string' && args.dir.trim() ? args.dir.trim() : join(workspaceRoot(cfg), name)
+          const b = board(cfg)
+          const pushed = await b.push(localPath, cfg.appRoot, { timeoutMs: seconds(args.timeoutSec, 180, 5, 1800) })
+          const result = toToolResult(pushed.res, pushed.command, { serial: b.serial, localPath })
+          // 板端目录可能归 root（adb push 以 shell 身份写），尽力修正属主；失败不影响推送结果。
+          const chown = await b.shell(`chown -R arduino:arduino ${cfg.appRoot}/${name} 2>&1 || true`, { timeoutMs: 30000 })
+          if (chown.res.code !== 0) result.chownWarning = (chown.res.stderr || chown.res.stdout || '').trim()
+          if (args.restart !== false) {
+            const restarted = await b.cli(['app', 'restart', id.value], { timeoutMs: seconds(args.timeoutSec, 300, 5, 1800) })
+            result.restart = toToolResult(restarted.res, restarted.command, {})
+          }
+          return result
+        })
+      },
+    })
+
+    // ── 板端命令 / 目录 ──────────────────────────────────────────────────────
+
+    register({
+      name: 'applab_shell',
+      description:
+        '在板子上执行一条 POSIX shell 命令（adb shell，以板端用户身份）。这是逃生通道：优先用专用工具；查看/修改 App 源码请走 applab_app_pull/push，不要用 cat/sed 改板上的文件（改动会绕过本地工作区，且容易和推送互相覆盖）。',
+      parameters: {
+        command: { type: 'string', required: true, description: '要执行的命令，例如 ls -la /home/arduino/ArduinoApps' },
+        timeoutSec: { type: 'number', description: '超时（秒，默认 120）' },
+      },
+      output: output(),
+      async execute(args) {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          const command = String(args.command || '').trim()
+          if (!command) return { ok: false, error: 'command 不能为空。' }
+          const b = board(cfg)
+          const { res, command: shown } = await b.shell(command, {
+            timeoutMs: seconds(args.timeoutSec, 120, 1, 1800),
+          })
+          return toToolResult(res, shown, { serial: b.serial })
+        })
+      },
+    })
+
+    register({
+      name: 'applab_bricks_list',
+      description: '列出板子上可用的 Bricks：`brick list`。给 App 加 Brick 或排查缺 Brick 时用。',
+      parameters: {},
+      output: output(),
+      async execute() {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          return cli(cfg, ['brick', 'list'], { timeoutMs: 45000 })
+        })
+      },
+    })
+
+    register({
+      name: 'applab_models_list',
+      description: '列出板子上的 AI 模型（`model list`），含是否已安装。装模型用 applab_shell 跑 `arduino-app-cli model install <id>`。',
+      parameters: {},
+      output: output(),
+      async execute() {
+        return guarded(async () => {
+          const { config: cfg } = config()
+          return cli(cfg, ['model', 'list'], { timeoutMs: 60000 })
+        })
+      },
+    })
+  },
+}

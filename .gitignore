@@ -1,0 +1,12 @@
+# 依赖与本地构建产物
+node_modules/
+applab-workspaces/
+
+# 从板子拉下来的 App 工作区（含源码与可能的密钥）
+workspaces/
+
+# 编辑器/系统杂项
+.vscode/
+.DS_Store
+Thumbs.db
+*.log

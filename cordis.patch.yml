@@ -1,0 +1,7 @@
+# dsh-applab-bridge 补丁层：把插件本体插入 profile 的插件树。
+# 由 package.json 的 "dsh": { "bundle": { "patch": "./cordis.patch.yml" } } 声明，
+# `dsh plugin add` 或插件管理器安装后自动生效；手动安装时把下面 4 行并入
+# profile 的 cordis.patch.yml 末尾即可。
+- insert:
+    - id: applab
+      name: dsh-applab-bridge
