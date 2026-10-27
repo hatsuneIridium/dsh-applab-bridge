@@ -12,6 +12,7 @@ import { parseDevices, pickDevice, resolveAdb, runProcess } from '../lib/adb.js'
 import {
   buildCliCommand,
   decodeAppID,
+  explainCliFailure,
   isActiveStatus,
   newAppArgv,
   normalizeAppId,
@@ -195,4 +196,18 @@ test('workspaceRoot 优先配置，否则落在 DSH_HOME 下', () => {
     workspaceRoot({ workspace: '' }, { DSH_HOME: 'D:/dsh-home' }),
     join('D:/dsh-home', 'dsh-applab-bridge', 'workspaces'),
   )
+})
+
+test('explainCliFailure 在缺前缀时也给出可操作提示', () => {
+  // 旧缺陷：command 里没有 arduino-app-cli 时，原来那条 hint 永远不命中
+  const noPrefix = explainCliFailure('brick list', '/bin/bash: line 1: brick: command not found')
+  assert.match(noPrefix, /brick/)
+  assert.match(noPrefix, /arduino-app-cli/)
+
+  const withPrefix = explainCliFailure('arduino-app-cli version', 'version: command not found')
+  assert.match(withPrefix, /找不到 arduino-app-cli/)
+
+  // 其它错误不应被误判成 command-not-found
+  assert.equal(explainCliFailure('arduino-app-cli app list', ''), '')
+  assert.match(explainCliFailure('arduino-app-cli app list --all', 'unknown flag: --all'), /版本较旧/)
 })

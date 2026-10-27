@@ -143,7 +143,7 @@ applab_app_logs    id="user:hammer-sickle-test"
 - 内置示例（`examples:` / `release:`）只读：先 `applab_app_create` 用 `fromApp` 复制。
 - 首次 `app start` 要编译 sketch / 拉容器，含 sketch 的冷启动约 3–5 分钟；插件在板端后台执行并轮询，不会因等待超时打断启动。
 - 板子没有联网时，`app start` 里需要下载依赖的步骤会失败（日志里有 ERROR），这是板端环境问题，不是插件问题。
-- 0.13 的 `model list` 在无网络时会长时间不返回（插件 20 秒超时并明确标记）。
+- 0.13 的 `model list` 会留下继承 stdout 的 daemon 进程，直接 `adb shell` 会挂住；插件改为板端后台执行 + 读文件，15 秒超时也会返回已采到的部分。
 - 0.13 的 `app destroy` 只清容器/缓存，**不删源码目录**；要彻底删除需自行 `rm -rf /home/arduino/ArduinoApps/<app>`。插件暂未封装删除。
 
 ## 安全
@@ -156,7 +156,7 @@ applab_app_logs    id="user:hammer-sickle-test"
 | --- | --- |
 | 生成方式 | 代码由 **AI（DeepSeek Harness 内的 agent）** 在会话中生成：需求 → 设计 → 实现 → 测试脚本，均在同一会话内完成。 |
 | 人工审查 | 提交者逐文件审查了：命令拼装与注入面（`lib/commands.js` 的引用与白名单校验）、adb 设备选择与超时/杀进程逻辑、配置读写与首次生成、工具描述与错误提示；确认无误后提交。 |
-| 已验证 | 16 项单元测试（参数校验、shell 引用、设备解析、配置读写、进程超时、`app list` 表格/JSON 解析）+ 插件形状冒烟 + **真机全链路**：UNO Q（CLI 0.13.0）上 `doctor/status/apps_list/create/start/logs/details/pull/push/stop` 全部跑通；`app start` 冷启动约 6 秒（Python-only），日志出现 `App started`，`app list` 状态变 running。 |
+| 已验证 | 17 项单元测试（参数校验、shell 引用、设备解析、配置读写、进程超时、`app list` 表格/JSON 解析、错误提示）+ 插件形状冒烟 + **真机只读自检**（`test/live-board.mjs`：doctor/status/apps_list/bricks/models/details 全过）+ **真机全链路**：UNO Q（CLI 0.13.0）上 `create/start/logs/pull/push/stop` 全部跑通；`app start` 冷启动约 6 秒（Python-only）。 |
 | 未验证 | 0.14+ 的 `app ps` / `app details` / `app list --all` 分支没有实机（本机板子是 0.13）；网络模式（SSH）；Windows 以外的平台。 |
 | 提交记录 | 首个功能提交的 message 中同样标注了 AI 生成与人工审查。 |
 
@@ -172,6 +172,9 @@ node --test test/unit.test.mjs
 #   node_modules/@deepseek-ai/dsh-tools/{package.json,index.js}
 #   index.js: export const defineTool = (d) => d
 node test/smoke.mjs
+
+# 真机只读自检（需要板子 USB 在线，同样先放桩）
+node test/live-board.mjs
 ```
 
 （宿主里 `@deepseek-ai/dsh-tools` 由 DSH 自己提供；桩只用于脱离宿主跑测试，装插件前要删掉 `node_modules`，否则会遮蔽真包。）
@@ -179,7 +182,7 @@ node test/smoke.mjs
 ## Roadmap
 
 - SSH / 网络模式（板子不在 USB 上时）
-- 结构化 `app list`（等 CLI 提供 JSON 输出，或加一层解析）
+- 结构化 `app list`（0.14+ 已有 `--all`；0.13 仍需文本解析）
 - 串口监视器（`arduino-app-cli monitor`）与 App 端口查看（`app ports`）
 - Brick 变量配置（`app brick config`）与模型安装（`model install`）专用工具
 - 与 dsh-permgate 联动的默认权限分类

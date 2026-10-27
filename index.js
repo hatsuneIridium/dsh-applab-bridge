@@ -476,15 +476,27 @@ export default {
 
     register({
       name: 'applab_models_list',
-      description: '列出板子上的 AI 模型（`model list`）。装模型用 applab_shell 跑 `arduino-app-cli model install <id>`。注意：0.13 的 model list 偶尔会卡住（可能在校验远端目录），这里默认 20 秒超时并明确标记。',
+      description: '列出板子上的 AI 模型（`model list`）。装模型用 applab_shell 跑 `arduino-app-cli model install <id>`。0.13 的 model list 会留下继承 stdout 的 daemon 进程，直接调 adb 会挂住；这里改成后台执行 + 读文件，超时也能返回已采到的部分。',
       parameters: {},
       output: output(),
       async execute() {
         return guarded(async () => {
           const { config: cfg } = config()
-          const result = await cli(cfg, ['model', 'list'], { timeoutMs: 20000 })
-          if (result.timedOut) {
-            result.note = 'model list 在 20 秒内没有返回，已中止（板端 CLI 可能正在联网校验模型目录）。可稍后重试，或在 App Lab 里查看模型页。'
+          const b = board(cfg)
+          const { res, command, logPath, timedOut } = await b.collectCli(['model', 'list'], { timeoutMs: 15000 })
+          const hasOutput = Boolean((res.stdout || '').trim())
+          const result = {
+            ok: hasOutput && !timedOut,
+            command,
+            serial: b.serial,
+            logPath,
+          }
+          if (hasOutput) result.output = res.stdout.trim()
+          if (timedOut) {
+            result.timedOut = true
+            result.note = hasOutput
+              ? 'model list 没有在 15 秒内结束，已返回采集到的部分输出（板端可能在联网校验模型目录）。'
+              : 'model list 15 秒内没有输出，已放弃等待；稍后重试，或在 App Lab 里查看模型页。'
           }
           return result
         })
